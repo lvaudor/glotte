@@ -1,0 +1,225 @@
+---
+title: "Archive glotte data into GloUrb database"
+format: html
+editor: visual
+---
+
+```{r setup}
+library(tidyverse)
+path_archive=here::here("data-raw/archive/")
+data_correspondances<- readr::read_csv(paste0(path_archive,"table_correspondances.csv"))
+fid_id_correspondance <-readr::read_csv(paste0(path_archive,"fid_id_correspondance.csv")) %>% 
+  rename(citycode=ID)
+
+df_topics = data.frame(cluster = c(1:14,NA),
+                         couleur = c("#8dd3c7",
+                                           "#fdb462",
+                                           "#bebada",
+                                           "#ffed6f",
+                                           "#b3de69",
+                                           "#bf812d", 
+                                           "#d9d9d9",
+                                           "#fccde5",
+                                           "#bc80bd",
+                                           "#80b1d3",
+                                           "#ccebc5",
+                                           "#9e0142",
+                                           "#fb8072",
+                                           "#f781bf",
+                                           "#969696"),
+                               label = c("Hydrography, floods", 
+                                         "Alert system", 
+                                         "Pollution, sewerage", 
+                                         "Quality measurements", 
+                                         "Planning, management, environment", 
+                                         "Industry", "Outliers - Internet",
+                                         "Infrastructure, transport", 
+                                         "Culture, architecture", 
+                                         "Tourism, navigation",
+                                         "Health",
+                                         "History, religion",
+                                         "Government, army, conflicts",
+                                         "Education", 
+                                         "NA"))
+conn=glourbi::connect_to_glourb()
+```
+
+# Table txt_page
+
+```{r}
+data_text <- readr::read_csv(paste0(path_archive,"data_text.csv"))
+data_text_clean=data_text %>%
+  select(-1,-3) %>% 
+  left_join(fid_id_correspondance,by="fid") %>% 
+  select(citycode,urban_aggl,ville,riviere,everything(),-fid)
+# DBI::dbWriteTable(conn=conn,
+#                   name="txt_page",
+#                  value=data_text_clean, overwrite=TRUE)
+DBI::dbWriteTable(conn=conn,
+                  name="txt_city_rivers",
+                  value=data_text_clean %>% select(citycode,river_en) %>% unique(),
+overwrite=TRUE)
+```
+
+# Table txt_topics
+
+```{r}
+txt_spec=DBI::dbGetQuery(conn,"SELECT cluster_name, citycode,river_en, segment_source FROM txt_segment;")
+txt_spec=txt_spec %>% 
+  mutate(context=paste0(citycode,"---",river_en)) %>% 
+  group_by(citycode,river_en) %>% 
+  mutate(npages=n_distinct(segment_source)) %>% 
+  ungroup()
+txt_topics=mixr::tidy_specificities(txt_spec,cluster_name,context) %>% 
+  tidyr::separate(context,into=c("citycode","river_en"),sep="---") %>% 
+  group_by(citycode,river_en) %>% 
+  mutate(ntot=sum(n,na.rm=TRUE)) %>% 
+  mutate(prop=n/ntot) %>% 
+  ungroup() %>% 
+  left_join(df_topics,by=c("cluster_name"="label")) %>% 
+  left_join(txt_spec %>% select(citycode,river_en,npages) %>% unique(),
+            by=c("citycode","river_en")) 
+  
+DBI::dbWriteTable(conn,name="txt_topics",value=txt_topics, overwrite=TRUE)
+```
+
+```{r}
+txt_topics=DBI::dbReadTable(conn=conn,name="txt_topics") %>% 
+  mutate(spec=case_when(spec==Inf~1000,
+                        TRUE~spec))
+txt_topics_summary=txt_topics %>% 
+  arrange(citycode,desc(spec),desc(n)) %>% 
+  group_by(citycode) %>% 
+  slice(1) %>% 
+  select(citycode,cluster_name,river_en,spec,n,couleur,prop,npages) %>% 
+  left_join(glourbi::all_cities %>% select(Urban.Aggl,citycode=ID,Latitude,Longitude),by="citycode") %>% 
+  na.omit() %>% 
+  sf::st_as_sf(coords=c("Latitude","Longitude"))
+
+topics_clusters=txt_topics %>% 
+  select(citycode,river_en,cluster_name,prop, couleur) %>% 
+  tidyr::pivot_wider(names_from=cluster_name, values_from=prop,
+                     values_fill=0, names_prefix="topic_") %>% 
+  mutate(across(starts_with("topic_"),replace_na,0)) 
+
+
+topics_clusters_num=topics_clusters %>% select(starts_with("topic_")) 
+
+pca=FactoMineR::princomp(topics_clusters_num)
+#explor::explor(pca)
+
+clust=hclust(dist(topics_clusters_num))
+topics_colors=txt_topics %>% select(cluster_name, couleur) %>% unique()
+
+
+topics_clusters=topics_clusters %>% 
+  mutate(topicfamily=cutree(clust,k=8)) %>% 
+  tidyr::pivot_longer(starts_with("topic_"),names_prefix="topic_", names_to="topic", values_to="prop")
+ggplot(topics_clusters, 
+       aes(x=topic, y=prop,fill=topic))+
+  geom_boxplot()+
+  facet_wrap(facets=vars(topicfamily))+
+  coord_flip()+
+  scale_fill_manual(breaks=topics_colors$cluster_name, values=topics_colors$couleur)
+
+```
+
+# Table txt_segment
+
+```{r}
+
+cluster_names <- readr::read_delim(paste0(path_archive,"cluster_names.csv"),"\t")
+clusters=list.files(paste0(path_archive,"clusters_city"))
+for (i in 1:length(clusters)){
+  print(i)
+  result=read_csv(paste0(path_archive,"clusters_city/",clusters[i])) %>%
+    mutate(fid=as.character(fid)) %>%
+    left_join(fid_id_correspondance,by="fid") %>%
+    left_join(cluster_names,by="cluster") %>%
+    select(citycode,
+           link,
+           segment_source,
+           text,
+           cluster,
+           cluster_name=name) 
+  result_page=glourbi::get_city_tib("txt_page",
+                                    thisCityCode=unique(result$citycode),
+                                    conn=conn)
+  result=result %>% 
+    left_join(result_page %>% select(citycode,river_en,link,id, query),
+              by=c("citycode","link","segment_source"="id")) %>% 
+    select(citycode,river_en, query, link,segment_source,text,cluster,cluster_name)
+  
+  DBI::dbWriteTable(conn=conn,
+                    name="txt_segment_new",
+                    value=result,
+                    append=TRUE)
+}
+
+```
+
+# localness
+
+```{r}
+data_city_river = read.csv(paste0(path_archive,"table_correspondances.csv"))
+# dataframe indicating for each page if it's local or not
+localness_pages = read.csv(paste0(path_archive,"localness_page_scores.csv"))
+# dataframe indicating the localness score for each city and for three cases
+# 1 - the URL AND the language are local
+# 2 - the URL is local
+# 3 - the language is local
+
+data_rivernames <- readr::read_csv(paste0(path_archive,"data_text.csv")) %>% 
+  left_join(fid_id_correspondance,by="fid") %>% 
+  select(citycode,riviere,river_en) %>%
+  unique()
+localness_1 = read.csv(paste0(path_archive,"city_locals_1.csv")) %>%
+  mutate(localness="URL_and_language")
+localness_2 = read.csv(paste0(path_archive,"city_locals_2.csv")) %>%
+  mutate(localness="URL")
+localness_3 = read.csv(paste0(path_archive,"/city_locals_3.csv")) %>%
+  mutate(localness="language")
+txt_localness=rbind(localness_1,localness_2,localness_3) %>% 
+  left_join(fid_id_correspondance,by="fid") %>% 
+  left_join(data_rivernames,by=c("citycode","riviere")) %>% 
+  select(localness,citycode,urban_aggl,river_en,latitude,longitude,n_local,n_tot,perc_local)
+# DBI::dbWriteTable(conn=conn,
+#                     name="txt_localness",
+#                     value=txt_localness)
+```
+
+
+```{r}
+
+get_tib=function(name, var, value,conn){
+  sql <- glue::glue("SELECT * FROM {name} WHERE {var} LIKE ?value")
+    query <- DBI::sqlInterpolate(conn, sql, value = value)
+    result <- DBI::dbGetQuery(conn = conn, statement = query)
+}
+
+result_page=get_tib(name="txt_page",
+                    var="citycode",
+                    value=glourbi::to_citycode("Lyon"),
+                    conn=conn) %>% 
+  select(river_en,query,id)
+
+result_segment=get_tib(name="txt_segment",
+        var="citycode",
+        value=glourbi::to_citycode("Lyon"),
+        conn=conn) 
+result_segment=result_segment %>% 
+  left_join(result_page,
+            by=c("segment_source"="id"))
+
+ truc=result_segment %>%
+   group_by(river_en,query,segment_source,link,cluster, cluster_name) %>%
+   summarise(nsegments=n(), .groups="drop") %>%
+   ungroup() %>%
+  group_by(river_en,query,segment_source,link) %>%
+  mutate(nsegments_tot=sum(nsegments)) %>% 
+   ungroup()
+
+  
+ggplot(tib_themes, aes(x=cluster_name, ))
+
+```
