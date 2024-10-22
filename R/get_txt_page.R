@@ -1,1 +1,3 @@
-get_txt_page=function()
+get_txt_page=function(){
+  
+}
