@@ -1,0 +1,1 @@
+This repo gathers the codes for a glotte package (which deals with textual data from the GloUrb project, interacting with the GloUrb database) and the guidelines according to which the raw data has been fed into the GloUrb database.
